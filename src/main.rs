@@ -1,10 +1,13 @@
+mod config;
 mod fetch;
 mod convert;
-mod pages;
 mod anchor_index;
+mod driver;
+mod source;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use config::Config;
 
 #[derive(Parser)]
 #[command(name = "tgdoc", about = "Telegram API docs -> structured Markdown")]
@@ -15,17 +18,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Fetch all pages and write docs/
+    /// Fetch and convert docs (all sources, or a single one by id)
     Fetch {
+        /// Source id from sources.toml (omit to run all)
+        source: Option<String>,
         /// Print heading tree only, don't write files
         #[arg(long)]
         dry: bool,
-        /// Proxy URL (e.g. http://127.0.0.1:8580)
-        #[arg(long, default_value = "http://127.0.0.1:8580")]
-        proxy: String,
         /// Output directory
         #[arg(long, default_value = "docs")]
         out: String,
+        /// Path to sources.toml
+        #[arg(long, default_value = "sources.toml")]
+        config: String,
     },
 }
 
@@ -33,8 +38,17 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Fetch { dry, proxy, out } => {
-            pages::run(&proxy, &out, dry).await?;
+        Commands::Fetch { source, dry, out, config } => {
+            let cfg = Config::load(&config)?;
+            let sources: Vec<_> = match &source {
+                Some(id) => vec![cfg.get(id)?],
+                None => cfg.sources.iter().collect(),
+            };
+            for src in sources {
+                println!("\n[source] {} (driver={}, parser={})", src.id, src.driver, src.parser);
+                let raw = driver::fetch(src).await?;
+                source::run_parser(src, raw, &out, dry).await?;
+            }
         }
     }
     Ok(())

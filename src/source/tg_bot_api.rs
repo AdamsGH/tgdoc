@@ -1,17 +1,15 @@
-use std::collections::HashMap;
 use std::path::Path;
 use anyhow::Result;
 use scraper::{Html, Selector, ElementRef, Node};
 
 use crate::anchor_index::AnchorIndex;
 use crate::convert::{element_to_md, frontmatter, extract_headings};
-use crate::fetch::{build_client, get_html};
+use crate::driver::RawData;
+use crate::config::SourceConfig;
 
-const BASE: &str = "https://core.telegram.org";
-
-struct PageDef {
-    url: &'static str,
-    out: &'static str,
+pub struct PageDef {
+    pub url: &'static str,
+    pub out: &'static str,
     split_by: SplitMode,
     tags: &'static [&'static str],
 }
@@ -112,28 +110,41 @@ fn h3_to_slug(id: &str) -> String {
 
 /// Pretty title from h3 text
 
-pub async fn run(proxy: &str, out_dir: &str, dry: bool) -> Result<()> {
-    let client = build_client(proxy)?;
+/// URL paths exposed so the http driver can enumerate them.
+pub const PAGE_DEFS: &[(&str, &str)] = &[
+    ("/bots/api", "api"),
+    ("/bots/api-changelog", "changelog"),
+    ("/bots/webapps", "webapps"),
+    ("/bots/payments", "payments-guide"),
+    ("/bots", "bots"),
+    ("/bots/faq", "faq"),
+    ("/bots/inline", "inline"),
+    ("/bots/webhooks", "webhooks"),
+    ("/bots/self-signed", "self-signed"),
+    ("/stickers", "stickers"),
+    ("/passport", "passport"),
+    ("/widgets/login", "widgets-login"),
+];
 
-    // Phase 1: fetch all pages
-    let mut html_cache: HashMap<&'static str, String> = HashMap::new();
-    for page in PAGES {
-        let url = format!("{}{}", BASE, page.url);
-        println!("[fetch] {}", url);
-        let html = get_html(&client, &url).await?;
-        println!("  {} bytes", html.len());
-        html_cache.insert(page.url, html);
-    }
+pub async fn run(cfg: &SourceConfig, raw: RawData, out_dir: &str, dry: bool) -> Result<()> {
+    let base_url = cfg.http.as_ref()
+        .map(|h| h.base_url.as_str())
+        .unwrap_or("https://core.telegram.org");
+
+    let html_cache = match raw {
+        RawData::Html(map) => map,
+        _ => anyhow::bail!("tg-html parser expects Html data"),
+    };
 
     if dry {
-        // Just print heading trees
         for page in PAGES {
             println!("\n=== {} ===", page.url);
-            let html = &html_cache[page.url];
-            let headings = extract_headings(html);
-            for (level, id, text) in &headings {
-                let indent = "  ".repeat((*level as usize).saturating_sub(2));
-                println!("{}[h{}] #{} {}", indent, level, id, text);
+            if let Some(html) = html_cache.get(page.url) {
+                let headings = extract_headings(html);
+                for (level, id, text) in &headings {
+                    let indent = "  ".repeat((*level as usize).saturating_sub(2));
+                    println!("{}[h{}] #{} {}", indent, level, id, text);
+                }
             }
         }
         return Ok(());
@@ -142,19 +153,23 @@ pub async fn run(proxy: &str, out_dir: &str, dry: bool) -> Result<()> {
     // Phase 2: build anchor index across all pages
     let mut index = AnchorIndex::new();
     for page in PAGES {
-        let html = &html_cache[page.url];
-        let headings = extract_headings(html);
-        for (_level, id, text) in &headings {
-            if id.is_empty() { continue; }
-            let doc_path = resolve_anchor_path(page, &id, &headings);
-            index.register(&id, &doc_path, &text);
+        if let Some(html) = html_cache.get(page.url) {
+            let headings = extract_headings(html);
+            for (_level, id, text) in &headings {
+                if id.is_empty() { continue; }
+                let doc_path = resolve_anchor_path(page, &id, &headings);
+                index.register(&id, &doc_path, &text);
+            }
         }
     }
 
     // Phase 3: write files
     for page in PAGES {
-        let html = &html_cache[page.url];
-        let source_url = format!("{}{}", BASE, page.url);
+        let html = match html_cache.get(page.url) {
+            Some(h) => h,
+            None => { eprintln!("[warn] no data for {}", page.url); continue; }
+        };
+        let source_url = format!("{}{}", base_url, page.url);
         match &page.split_by.clone() {
             SplitMode::Single => {
                 let path = format!("{}/{}", out_dir, page.out);

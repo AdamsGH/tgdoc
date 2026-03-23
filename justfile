@@ -1,5 +1,5 @@
-proxy := "http://127.0.0.1:8580"
-out   := "docs"
+out    := "docs"
+config := "sources.toml"
 
 # List available recipes
 default:
@@ -9,18 +9,18 @@ default:
 build:
     cargo build --release
 
-# Fetch all pages and write docs/
-fetch:
-    cargo run --release -- fetch --proxy {{proxy}} --out {{out}}
+# Fetch all sources (or a single one: just fetch tg-bot-api)
+fetch source="":
+    cargo run --release -- fetch --out {{out}} --config {{config}} {{source}}
 
 # Dry-run: print heading tree without writing files
-dry:
-    cargo run --release -- fetch --proxy {{proxy}} --out {{out}} --dry
+dry source="":
+    cargo run --release -- fetch --out {{out}} --config {{config}} --dry {{source}}
 
 # Re-fetch (clean docs first)
-refetch:
+refetch source="":
     rm -rf {{out}}
-    just fetch
+    just fetch {{source}}
 
 # Pack docs/ into a timestamped tar.gz
 pack:

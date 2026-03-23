@@ -1,0 +1,9 @@
+[[source]]
+id     = "tg-bot-api"
+driver = "http"
+parser = "tg-html"
+out    = "tg-bot-api"
+
+[source.http]
+base_url = "https://core.telegram.org"
+proxy    = "http://127.0.0.1:8580"
