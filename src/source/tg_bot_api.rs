@@ -150,15 +150,17 @@ pub async fn run(cfg: &SourceConfig, raw: RawData, out_dir: &str, dry: bool) -> 
         return Ok(());
     }
 
-    // Phase 2: build anchor index across all pages
+    let prefix = format!("{}/{}", out_dir, cfg.out);
+
+    // Phase 2: build anchor index — paths include the source prefix
     let mut index = AnchorIndex::new();
     for page in PAGES {
         if let Some(html) = html_cache.get(page.url) {
             let headings = extract_headings(html);
             for (_level, id, text) in &headings {
                 if id.is_empty() { continue; }
-                let doc_path = resolve_anchor_path(page, &id, &headings);
-                index.register(&id, &doc_path, &text);
+                let rel = resolve_anchor_path(page, id, &headings);
+                index.register(id, &format!("{}/{}", cfg.out, rel), text);
             }
         }
     }
@@ -172,54 +174,53 @@ pub async fn run(cfg: &SourceConfig, raw: RawData, out_dir: &str, dry: bool) -> 
         let source_url = format!("{}{}", base_url, page.url);
         match &page.split_by.clone() {
             SplitMode::Single => {
-                let path = format!("{}/{}", out_dir, page.out);
-                let doc_base = page.out.trim_end_matches(".md");
+                let path = format!("{}/{}", prefix, page.out);
+                let doc_base = format!("{}/{}", cfg.out, page.out.trim_end_matches(".md"));
                 println!("[write] {}", path);
-                let md = page_to_md(html, &index, doc_base, &source_url, page.tags);
+                let md = page_to_md(html, &index, &doc_base, &source_url, page.tags);
                 write_file(&path, &md)?;
             }
             SplitMode::ByH3 { dir } => {
-                let sections = split_by_h3(html, &index, dir);
+                let doc_dir = format!("{}/{}", cfg.out, dir);
+                let sections = split_by_h3(html, &index, &doc_dir);
                 for (slug, title, content) in &sections {
-                    let path = format!("{}/{}/{}.md", out_dir, dir, slug);
+                    let path = format!("{}/{}/{}.md", prefix, dir, slug);
                     let fm = frontmatter(title, &source_url, page.tags);
                     println!("[write] {}", path);
                     write_file(&path, &format!("{}{}", fm, content))?;
                 }
-                // Write index file
-                let idx_path = format!("{}/{}/index.md", out_dir, dir);
-                let idx_content = build_index(dir, &sections, &source_url, page.tags);
+                let idx_path = format!("{}/{}/index.md", prefix, dir);
+                let idx_content = build_index(&doc_dir, &sections, &source_url, page.tags);
                 write_file(&idx_path, &idx_content)?;
             }
             SplitMode::Changelog { dir } => {
-                let entries = split_changelog(html, &index, dir);
+                let doc_dir = format!("{}/{}", cfg.out, dir);
+                let entries = split_changelog(html, &index, &doc_dir);
                 for entry in &entries {
-                    let path = format!("{}/{}/{}/{}.md", out_dir, dir, entry.year, entry.slug);
+                    let path = format!("{}/{}/{}/{}.md", prefix, dir, entry.year, entry.slug);
                     println!("[write] {}", path);
                     let source_anchor = format!("{}#{}", source_url,
                         entry.slug.to_lowercase().replace('.', "-").replace("botapi-", ""));
                     let fm = changelog_frontmatter(&entry.version, &entry.date, &source_anchor);
                     write_file(&path, &format!("{}{}", fm, entry.content))?;
                 }
-                // Index per year
                 let mut by_year: std::collections::BTreeMap<&str, Vec<&ChangelogEntry>> = Default::default();
                 for e in &entries {
                     by_year.entry(&e.year).or_default().push(e);
                 }
                 for (year, year_entries) in &by_year {
-                    let idx_path = format!("{}/{}/{}/index.md", out_dir, dir, year);
-                    let idx = build_year_index(dir, year, year_entries, &source_url);
+                    let idx_path = format!("{}/{}/{}/index.md", prefix, dir, year);
+                    let idx = build_year_index(&doc_dir, year, year_entries, &source_url);
                     write_file(&idx_path, &idx)?;
                 }
-                // Top-level changelog index
-                let idx_path = format!("{}/{}/index.md", out_dir, dir);
-                let idx = build_changelog_index(dir, &by_year, &source_url);
+                let idx_path = format!("{}/{}/index.md", prefix, dir);
+                let idx = build_changelog_index(&doc_dir, &by_year, &source_url);
                 write_file(&idx_path, &idx)?;
             }
         }
     }
 
-    println!("\nDone. Files written to {}/", out_dir);
+    println!("\nDone. Files written to {}/", prefix);
     Ok(())
 }
 

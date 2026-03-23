@@ -47,7 +47,7 @@ pub async fn run(cfg: &SourceConfig, raw: RawData, out_dir: &str, dry: bool) -> 
     for cls in &classes {
         let doc_path = class_doc_path(&cls.namespace, &cls.name);
         let path = out.join(format!("{}.md", doc_path));
-        let md = render_class(cls, &index, cfg);
+        let md = render_class(cls, &index, cfg, &doc_path);
         write_file(&path, &md)?;
         println!("[write] {}", path.display());
     }
@@ -152,7 +152,8 @@ fn parse_python_classes(src: &str, namespace: &str, path: &Path) -> Vec<ClassDef
                 class_header.push_str(lines[j].trim());
             }
 
-            if let Some(cls) = parse_class_header(&class_header, src, &lines, i, namespace, path) {
+            // pass j (last line of class header) so body starts at j+1
+            if let Some(cls) = parse_class_header(&class_header, src, &lines, j, namespace, path) {
                 classes.push(cls);
             }
             i = j + 1;
@@ -215,77 +216,97 @@ fn parse_class_body(
     attrs: &mut Vec<AttrDef>,
     methods: &mut Vec<MethodDef>,
 ) {
-    let re_method = Regex::new(r"^\s{4}(async\s+)?def\s+(\w+)\s*\(([^)]*)\)").unwrap();
-    let re_attr_annotated = Regex::new(r"^\s{4}(\w+):\s*(.+)").unwrap();
+    // class body members sit at class_indent + 4
+    let class_indent = lines[class_line].len() - lines[class_line].trim_start().len();
+    let member_indent = class_indent + 4;
+
+    // match just "def name(" - signature collected separately via collect_signature
+    let re_method = Regex::new(r"^(async\s+)?def\s+(\w+)\s*\(").unwrap();
+    let re_attr = Regex::new(r"^(\w+):\s*(.+)").unwrap();
 
     let mut i = class_line + 1;
-    let class_indent = 0usize;
-
     while i < lines.len() {
         let line = lines[i];
+        if line.trim().is_empty() { i += 1; continue; }
+
+        let indent = line.len() - line.trim_start().len();
+
+        // back to class level or higher = end of class body
+        if indent <= class_indent && !line.trim().is_empty() { break; }
+
+        // only look at direct class members, skip nested blocks
+        if indent != member_indent { i += 1; continue; }
+
         let stripped = line.trim_start();
 
-        // stop at next top-level definition (another class or module-level def)
-        if !line.is_empty() && !stripped.starts_with('#') {
-            let indent = line.len() - stripped.len();
-            if indent == class_indent && (stripped.starts_with("class ") || stripped.starts_with("def ")) {
-                break;
-            }
-        }
-
-        if let Some(caps) = re_method.captures(line) {
+        if let Some(caps) = re_method.captures(stripped) {
             let is_async = caps.get(1).is_some();
             let mname = caps[2].to_string();
-            if mname.starts_with('_') && !mname.starts_with("__") {
-                i += 1;
-                continue;
-            }
-            let params = caps[3].to_string();
+            let sig = collect_signature(lines, i);
             let docstring = extract_docstring_after(lines, i);
-            // consume lines until we leave this method
-            let method_end = find_block_end(lines, i);
-            methods.push(MethodDef {
-                name: mname,
-                is_async,
-                signature: params,
-                docstring,
-            });
-            i = method_end;
-            continue;
-        }
-
-        // annotated class-level attribute (inside __init__ is handled separately)
-        if let Some(caps) = re_attr_annotated.captures(line) {
-            let aname = caps[1].to_string();
-            if !aname.starts_with('_') && aname != "def" && aname != "class" {
-                let type_hint = caps[2].trim_end_matches('=').trim().to_string();
-                let docstring = extract_docstring_after(lines, i);
-                attrs.push(AttrDef {
-                    name: aname,
-                    type_hint,
+            if !mname.starts_with('_') || mname.starts_with("__") {
+                methods.push(MethodDef {
+                    name: mname,
+                    is_async,
+                    signature: sig,
                     docstring,
                 });
             }
+            // skip past method body: stop only when we hit the next member-level def/class
+            let body_start = i + 1;
+            i = body_start;
+            while i < lines.len() {
+                let l = lines[i];
+                if l.trim().is_empty() { i += 1; continue; }
+                let ind = l.len() - l.trim_start().len();
+                if ind < member_indent { break; } // back to class or module level
+                if ind == member_indent {
+                    let s = l.trim_start();
+                    if s.starts_with("def ") || s.starts_with("async def ")
+                        || s.starts_with("class ") || s.starts_with('@')
+                    {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // annotated class-level attribute
+        if let Some(caps) = re_attr.captures(stripped) {
+            let aname = caps[1].to_string();
+            if !aname.starts_with('_') && aname != "def" && aname != "class" {
+                let type_hint = caps[2].split('=').next().unwrap_or("").trim().to_string();
+                attrs.push(AttrDef { name: aname, type_hint, docstring: String::new() });
+            }
         }
 
         i += 1;
     }
 }
 
-/// Find the line index just past the end of the indented block starting at `start`.
-fn find_block_end(lines: &[&str], start: usize) -> usize {
-    if start + 1 >= lines.len() { return start + 1; }
-    let base_indent = lines[start].len() - lines[start].trim_start().len();
-    let mut i = start + 1;
-    while i < lines.len() {
-        let l = lines[i];
-        if l.trim().is_empty() { i += 1; continue; }
-        let ind = l.len() - l.trim_start().len();
-        if ind <= base_indent { return i; }
+/// Collect the full parameter list for a def, handling multi-line signatures.
+fn collect_signature(lines: &[&str], def_line: usize) -> String {
+    let mut buf = lines[def_line].trim_start().to_string();
+    let mut i = def_line + 1;
+    // if opening paren not closed on first line, keep appending
+    while !buf.contains("):") && !buf.ends_with("):") && i < lines.len() {
+        buf.push(' ');
+        buf.push_str(lines[i].trim());
         i += 1;
+        if i - def_line > 30 { break; } // safety limit
     }
-    i
+    // extract just the params between first ( and last )
+    if let Some(start) = buf.find('(') {
+        if let Some(end) = buf.rfind(')') {
+            return buf[start + 1..end].trim().to_string();
+        }
+    }
+    String::new()
 }
+
+/// Find the line index just past the end of the indented block starting at `start`.
 
 /// Extract the first triple-quoted docstring following line `after`.
 fn extract_docstring_after(lines: &[&str], after: usize) -> String {
@@ -476,8 +497,7 @@ fn class_doc_path(namespace: &str, class_name: &str) -> String {
     format!("{}/{}", namespace.replace('.', "/"), class_name)
 }
 
-fn render_class(cls: &ClassDef, _index: &AnchorIndex, cfg: &SourceConfig) -> String {
-    // strip the local clone prefix "repos/ptb/" to get the repo-relative path
+fn render_class(cls: &ClassDef, index: &AnchorIndex, cfg: &SourceConfig, doc_path: &str) -> String {
     let repo_rel = cls.source_file
         .split_once("src/telegram")
         .map(|(_, rest)| format!("src/telegram{}", rest))
@@ -507,7 +527,7 @@ fn render_class(cls: &ClassDef, _index: &AnchorIndex, cfg: &SourceConfig) -> Str
     }
 
     if !cls.docstring.is_empty() {
-        md.push_str(&rst_to_md(&cls.docstring));
+        md.push_str(&rst_to_md_with_links(&cls.docstring, index, doc_path, &cfg.out));
         md.push_str("\n\n");
     }
 
@@ -519,7 +539,7 @@ fn render_class(cls: &ClassDef, _index: &AnchorIndex, cfg: &SourceConfig) -> Str
                 md.push_str(&format!("**Type:** `{}`\n\n", attr.type_hint));
             }
             if !attr.docstring.is_empty() {
-                md.push_str(&rst_to_md(&attr.docstring));
+                md.push_str(&rst_to_md_with_links(&attr.docstring, index, doc_path, &cfg.out));
                 md.push('\n');
             }
         }
@@ -529,17 +549,84 @@ fn render_class(cls: &ClassDef, _index: &AnchorIndex, cfg: &SourceConfig) -> Str
         md.push_str("## Methods\n\n");
         for method in &cls.methods {
             md.push_str(&format!("### {}\n\n", method.name));
-            let prefix = if method.is_async { "async " } else { "" };
+            let async_kw = if method.is_async { "async " } else { "" };
             md.push_str(&format!("```python\n{}def {}({})\n```\n\n",
-                prefix, method.name, method.signature));
+                async_kw, method.name, method.signature));
             if !method.docstring.is_empty() {
-                md.push_str(&rst_to_md(&method.docstring));
+                md.push_str(&rst_to_md_with_links(&method.docstring, index, doc_path, &cfg.out));
                 md.push('\n');
             }
         }
     }
 
     md
+}
+
+/// RST → MD with Obsidian wiki-link resolution for :class:/:meth: refs.
+fn rst_to_md_with_links(rst: &str, index: &AnchorIndex, current_doc: &str, source_prefix: &str) -> String {
+    let _text = rst_to_md(rst); // kept for reference; actual processing below uses original RST
+
+    // after rst_to_md, :class:`telegram.Bot` becomes `Bot` (backtick inline code)
+    // but before that substitution we can intercept the original RST refs
+    // Re-process the original RST for link candidates
+    let re_class = Regex::new(r":class:`([^`]+)`").unwrap();
+    let re_meth  = Regex::new(r":meth:`([^`]+)`").unwrap();
+
+    let mut out = rst.to_string();
+
+    // Replace :class:`telegram.Foo` with wiki-link if in index, else plain `Foo`
+    out = re_class.replace_all(&out, |caps: &regex::Captures| {
+        let full = &caps[1];
+        let short = full.split('.').last().unwrap_or(full);
+        let key = short.to_lowercase();
+        if let Some(wiki) = index.resolve(&format!("#{}", key), current_doc) {
+            format!("[{}]({})", short, wiki)
+        } else {
+            // try constructing path directly from namespace
+            let ns_path = full.replace('.', "/");
+            format!("[[{}/{}|{}]]", source_prefix, ns_path, short)
+        }
+    }).to_string();
+
+    out = re_meth.replace_all(&out, |caps: &regex::Captures| {
+        let full = &caps[1];
+        let parts: Vec<&str> = full.rsplitn(2, '.').collect();
+        let (method, class_path) = if parts.len() == 2 {
+            (parts[0], Some(parts[1]))
+        } else {
+            (parts[0], None)
+        };
+        let key = format!("{}.{}", 
+            class_path.unwrap_or("").split('.').last().unwrap_or("").to_lowercase(),
+            method.to_lowercase());
+        if let Some(wiki) = index.resolve(&format!("#{}", key), current_doc) {
+            format!("[{}]({})", method, wiki)
+        } else {
+            format!("`{}`", method)
+        }
+    }).to_string();
+
+    // now apply the rest of rst_to_md (everything except the :class:/:meth: we already handled)
+    rst_to_md_no_class_meth(&out)
+}
+
+/// Same as rst_to_md but skips :class: and :meth: (already resolved by caller).
+fn rst_to_md_no_class_meth(rst: &str) -> String {
+    let mut out = rst.to_string();
+    let re_attr = Regex::new(r":attr:`([^`]+)`").unwrap();
+    out = re_attr.replace_all(&out, "`$1`").to_string();
+    let re_obj = Regex::new(r":obj:`([^`]+)`").unwrap();
+    out = re_obj.replace_all(&out, "`$1`").to_string();
+    let re_any = Regex::new(r":(?:any|ref|wiki):`([^<`]+)(?:\s*<[^>]+>)?`").unwrap();
+    out = re_any.replace_all(&out, "`$1`").to_string();
+    out = convert_rst_code_blocks(&out);
+    let re_version = Regex::new(r"\.\. version(?:added|changed|deprecated)::\s*(\S+)([^\n]*)").unwrap();
+    out = re_version.replace_all(&out, "> *$0*").to_string();
+    let re_seealso = Regex::new(r"\.\. seealso::([^\n]*)").unwrap();
+    out = re_seealso.replace_all(&out, "**See also:**$1").to_string();
+    let re_admonition = Regex::new(r"\.\. (note|tip|warning|caution)::([^\n]*)").unwrap();
+    out = re_admonition.replace_all(&out, "> **$1:**$2").to_string();
+    out
 }
 
 /// Minimal RST -> Markdown conversion for docstrings.
