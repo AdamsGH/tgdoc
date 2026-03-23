@@ -159,6 +159,35 @@ just tag-release 1.1.0    # bumps Cargo.toml, commits, then tags
 just retag
 ```
 
+## Installation
+
+Download a release archive from the [Releases](https://github.com/AdamsGH/tgdoc/releases)
+page. Each archive contains:
+
+```
+tgdoc           # binary
+sources.toml    # source configuration
+justfile        # convenience recipes
+README.md
+```
+
+Extract and run from the same directory:
+
+```sh
+tar -xzf tgdoc-x86_64-unknown-linux-gnu.tar.gz
+./tgdoc fetch
+```
+
+`tgdoc` looks for `sources.toml` in this order:
+
+1. Path passed via `--config <path>`
+2. `sources.toml` in the current working directory
+3. `sources.toml` next to the binary
+
+So running from the extracted directory works out of the box. If you move the
+binary to `$PATH`, either keep `sources.toml` in your working directory or
+always pass `--config /path/to/sources.toml`.
+
 ## Notes
 
 - `docs/`, `repos/`, and `*.tar.gz` are gitignored

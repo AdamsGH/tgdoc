@@ -51,6 +51,7 @@ jobs:
           ARCHIVE=tgdoc-${TARGET}.tar.gz
           mkdir -p package
           cp target/${TARGET}/release/tgdoc package/tgdoc
+          cp sources.toml package/sources.toml
           cp README.md package/README.md
           cp justfile package/justfile
           tar -czf "${ARCHIVE}" -C package .

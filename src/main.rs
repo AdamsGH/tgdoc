@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Fetch { source, dry, out, config } => {
+            let config = config::resolve_config_path(&config);
             let cfg = Config::load(&config)?;
             let sources: Vec<_> = match &source {
                 Some(id) => vec![cfg.get(id)?],

@@ -40,7 +40,8 @@ fn default_ref() -> String {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read '{}': {}", path, e))?;
         let cfg: Config = toml::from_str(&text)?;
         for src in &cfg.sources {
             src.validate()?;
@@ -53,6 +54,31 @@ impl Config {
         self.sources.iter().find(|s| s.id == id)
             .ok_or_else(|| anyhow::anyhow!("unknown source id: {}", id))
     }
+}
+
+/// Resolve the config file path using a search order:
+///   1. Explicit --config value (always used as-is if provided by user)
+///   2. `sources.toml` in CWD
+///   3. `sources.toml` next to the binary
+pub fn resolve_config_path(explicit: &str) -> String {
+    // if user passed something other than the default, trust it verbatim
+    if explicit != "sources.toml" {
+        return explicit.to_string();
+    }
+    if std::path::Path::new("sources.toml").exists() {
+        return "sources.toml".to_string();
+    }
+    // try next to the binary
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe.parent()
+            .map(|p| p.join("sources.toml"))
+            .unwrap_or_default();
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    // fall back to CWD value and let load() produce a clear error
+    "sources.toml".to_string()
 }
 
 impl SourceConfig {
