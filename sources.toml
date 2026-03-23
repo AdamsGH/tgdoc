@@ -7,3 +7,13 @@ out    = "tg-bot-api"
 [source.http]
 base_url = "https://core.telegram.org"
 proxy    = "http://127.0.0.1:8580"
+
+[[source]]
+id     = "ptb"
+driver = "git"
+parser = "ptb"
+out    = "ptb"
+
+[source.git]
+repo    = "https://github.com/python-telegram-bot/python-telegram-bot"
+ref     = "master"
