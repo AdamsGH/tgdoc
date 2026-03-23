@@ -1,128 +1,166 @@
 # tgdoc
 
-Rust CLI that scrapes the Telegram Bot API documentation from `core.telegram.org`
-and converts it into structured, Obsidian-compatible Markdown files.
+Rust CLI that converts Telegram ecosystem documentation into structured,
+Obsidian-compatible Markdown. Every internal cross-reference becomes a
+`[[wiki-link]]` pointing to the correct file and heading.
 
-Every internal cross-reference becomes an `[[wiki-link]]` pointing to the correct
-file and heading. The output is ready to open as an Obsidian vault.
+## Sources
+
+Configured in `sources.toml`. Currently two sources:
+
+| id | driver | parser | What it produces |
+|---|---|---|---|
+| `tg-bot-api` | `http` | `tg-html` | Scrapes `core.telegram.org` - Bot API reference, changelog, guides |
+| `ptb` | `git` | `ptb` | Clones `python-telegram-bot` repo - class/method docs, changelog |
 
 ## Output structure
 
 ```
 docs/
-  api/
-    index.md
-    getting-updates.md
-    available-types.md
-    available-methods.md
-    updating-messages.md
-    inline-mode.md
-    payments.md
-    stickers.md
-    telegram-passport.md
-    games.md
-    ...
-  changelog/
-    index.md
-    2026/
+  tg-bot-api/
+    api/
       index.md
-      BotAPI-9.5.md      # date: 2026-03-01 in frontmatter
-      BotAPI-9.4.md
-    2025/
-      BotAPI-9.3.md
+      available-types.md
+      available-methods.md
+      getting-updates.md
       ...
-  webapps/
-    index.md
-    designing-mini-apps.md
-    implementing-mini-apps.md
-    initializing-mini-apps.md
-    testing-mini-apps.md
-  payments-guide/
-    index.md
-    the-payments-api.md
-    step-by-step-process.md
-    going-live.md
+    changelog/
+      index.md
+      2026/
+        index.md
+        BotAPI-9.5.md
+      2025/
+        ...
+    webapps/
+    payments-guide/
+    bots.md
     faq.md
-  bots.md
-  faq.md
-  inline.md
-  webhooks.md
-  self-signed.md
-  stickers.md
-  passport.md
-  widgets-login.md
+    inline.md
+    webhooks.md
+    ...
+
+  ptb/
+    index.md
+    telegram/
+      Bot.md
+      Message.md
+      Chat.md
+      ...
+    telegram/ext/
+      Application.md
+      CommandHandler.md
+      Filters.md
+      ...
+    telegram/request/
+      BaseRequest.md
+      HTTPXRequest.md
+    changelog/
+      index.md
+      2026/
+        v22.7.md
+        v22.6.md
+      2025/
+        ...
+      2017/
+        ...
 ```
 
-Each file has a YAML frontmatter block with `title`, `source`, `tags`, and
-(for changelog entries) `date`.
+Each file has YAML frontmatter with `title`, `source`, `tags`, and (for
+changelog entries) `date`.
 
 ## Usage
 
 ```sh
-# Fetch all pages and write docs/
+# Fetch all sources
 just fetch
 
-# Dry-run - print heading tree without writing anything
-just dry
+# Fetch a single source
+just fetch tg-bot-api
+just fetch ptb
 
-# Clean docs/ and re-fetch
+# Dry-run - print structure without writing files
+just dry
+just dry ptb
+
+# Clean and re-fetch
 just refetch
 
 # Pack docs/ into a timestamped tar.gz
 just pack
 
-# Fetch then pack in one step
+# Fetch then pack
 just all
 
 # Remove docs/ and archives
 just clean
 ```
 
-The proxy is configured at the top of `justfile`:
-
-```
-proxy := "http://127.0.0.1:8580"
-```
-
-Or pass it directly:
+Or directly via cargo:
 
 ```sh
-cargo run --release -- fetch --proxy http://127.0.0.1:8580 --out docs
+cargo run --release -- fetch --config sources.toml --out docs
+cargo run --release -- fetch tg-bot-api --dry
 ```
 
-## Pages fetched
+## sources.toml
 
-| Source URL | Output |
-|---|---|
-| `/bots/api` | `api/*.md` - split by section |
-| `/bots/api-changelog` | `changelog/<year>/BotAPI-X.Y.md` - one file per release |
-| `/bots/webapps` | `webapps/*.md` - split by section |
-| `/bots/payments` | `payments-guide/*.md` - split by section |
-| `/bots` | `bots.md` |
-| `/bots/faq` | `faq.md` |
-| `/bots/inline` | `inline.md` |
-| `/bots/webhooks` | `webhooks.md` |
-| `/bots/self-signed` | `self-signed.md` |
-| `/stickers` | `stickers.md` |
-| `/passport` | `passport.md` |
-| `/widgets/login` | `widgets-login.md` |
+```toml
+[[source]]
+id     = "tg-bot-api"
+driver = "http"
+parser = "tg-html"
+out    = "tg-bot-api"
+
+[source.http]
+base_url = "https://core.telegram.org"
+proxy    = "http://127.0.0.1:8580"   # optional
+
+[[source]]
+id     = "ptb"
+driver = "git"
+parser = "ptb"
+out    = "ptb"
+
+[source.git]
+repo = "https://github.com/python-telegram-bot/python-telegram-bot"
+ref  = "master"
+```
+
+Adding a new source requires: a `sources.toml` entry, a `src/source/<name>.rs`
+file implementing `run(cfg, raw, out_dir, dry)`, and a line in
+`src/source/mod.rs`.
 
 ## How links work
 
-The parser builds a global anchor index in a first pass over all pages.
-In the second pass every `<a href="...#anchor">` is resolved through the index
-and written as `[[file#Heading]]`. Links that cannot be resolved are kept as
-plain Markdown URLs.
+**tg-bot-api:** two-pass HTML scrape. First pass builds an anchor index
+(`#sendMessage` -> `[[tg-bot-api/api/available-methods#sendMessage]]`).
+Second pass converts every `<a href>` through the index.
 
-## Dependencies
+**ptb:** anchor index is built from parsed class and method names
+(`bot.send_message` -> `[[ptb/telegram/Bot#send_message]]`). RST `:class:`
+and `:meth:` directives in docstrings are resolved through the same index,
+producing cross-links between sources where possible.
 
-- `scraper` - HTML parsing
-- `reqwest` - HTTP with gzip and proxy support
-- `tokio` - async runtime
-- `clap` - CLI
-- `regex` - version extraction from changelog text
+## Drivers
+
+| driver | behaviour |
+|---|---|
+| `http` | `reqwest` + optional proxy, gzip. Fetches URLs defined by the parser. |
+| `git` | `git clone --depth 1` on first run, `git pull` on subsequent runs. Clone stored in `repos/<id>/` (gitignored). |
+
+## Releases
+
+```sh
+# Tag and push - triggers GitHub Actions to build x86_64 + aarch64 binaries
+just tag-release          # tags v<version in Cargo.toml>
+just tag-release 1.1.0    # bumps Cargo.toml, commits, then tags
+
+# Re-trigger an existing tag
+just retag
+```
 
 ## Notes
 
-- `docs/` and `*.tar.gz` are excluded from git (see `.gitignore`)
-- Requires a working HTTP proxy to reach `core.telegram.org`
+- `docs/`, `repos/`, and `*.tar.gz` are gitignored
+- `tg-bot-api` requires a proxy to reach `core.telegram.org`
+- `ptb` clones from GitHub directly (no proxy needed)
