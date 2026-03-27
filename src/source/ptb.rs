@@ -288,20 +288,41 @@ fn parse_class_body(
 
 /// Collect the full parameter list for a def, handling multi-line signatures.
 fn collect_signature(lines: &[&str], def_line: usize) -> String {
-    let mut buf = lines[def_line].trim_start().to_string();
-    let mut i = def_line + 1;
-    // if opening paren not closed on first line, keep appending
-    while !buf.contains("):") && !buf.ends_with("):") && i < lines.len() {
-        buf.push(' ');
-        buf.push_str(lines[i].trim());
-        i += 1;
-        if i - def_line > 30 { break; } // safety limit
-    }
-    // extract just the params between first ( and last )
-    if let Some(start) = buf.find('(') {
-        if let Some(end) = buf.rfind(')') {
-            return buf[start + 1..end].trim().to_string();
+    // Collect lines until the closing paren of the parameter list.
+    // Python method signatures end with ") -> ReturnType:" or just "):"
+    // We track paren depth to find the matching closing paren.
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    let mut found_open = false;
+    let mut i = def_line;
+    while i < lines.len() && i - def_line < 60 {
+        let line = lines[i].trim();
+        for ch in line.chars() {
+            match ch {
+                '(' => { depth += 1; found_open = true; buf.push(ch); }
+                ')' => {
+                    depth -= 1;
+                    buf.push(ch);
+                    if found_open && depth <= 0 {
+                        // extract params between outermost parens
+                        if let Some(start) = buf.find('(') {
+                            if let Some(end) = buf.rfind(')') {
+                                return buf[start + 1..end]
+                                    .split(',')
+                                    .map(|p| p.trim())
+                                    .filter(|p| !p.is_empty() && *p != "self")
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                            }
+                        }
+                        return String::new();
+                    }
+                }
+                _ => { if found_open { buf.push(ch); } }
+            }
         }
+        if found_open { buf.push(' '); }
+        i += 1;
     }
     String::new()
 }
@@ -311,8 +332,15 @@ fn collect_signature(lines: &[&str], def_line: usize) -> String {
 /// Extract the first triple-quoted docstring following line `after`.
 fn extract_docstring_after(lines: &[&str], after: usize) -> String {
     let mut i = after + 1;
-    // skip blank lines
-    while i < lines.len() && lines[i].trim().is_empty() { i += 1; }
+    // skip blank lines and the closing paren/return annotation of the signature
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if t.is_empty() || t == "):" || t.starts_with(") ->") || t.starts_with("->") {
+            i += 1;
+            continue;
+        }
+        break;
+    }
     if i >= lines.len() { return String::new(); }
 
     let first = lines[i].trim();
@@ -320,24 +348,37 @@ fn extract_docstring_after(lines: &[&str], after: usize) -> String {
                 else if first.starts_with("'''") { "'''" }
                 else { return String::new(); };
 
-    let start_content = first.trim_start_matches(delim);
-    // single-line docstring
-    if start_content.ends_with(delim) && start_content.len() > delim.len() {
-        return start_content.trim_end_matches(delim).trim().to_string();
+    let start_content = &first[delim.len()..];
+    // single-line docstring: """text"""
+    if start_content.ends_with(delim) {
+        return start_content[..start_content.len() - delim.len()].trim().to_string();
     }
-
-    let mut buf = vec![start_content.to_string()];
+    // opening line may have content after the triple-quote
+    let mut buf: Vec<String> = Vec::new();
+    if !start_content.trim().is_empty() {
+        buf.push(start_content.trim().to_string());
+    }
+    let base_indent = lines[i].len() - lines[i].trim_start().len();
     i += 1;
     while i < lines.len() {
-        let l = lines[i].trim();
-        if l.ends_with(delim) {
-            buf.push(l.trim_end_matches(delim).to_string());
+        let raw = lines[i];
+        let l = if raw.len() > base_indent { &raw[base_indent..] } else { raw.trim() };
+        if l.trim_end().ends_with(delim) {
+            let content = l.trim_end();
+            let without = &content[..content.len() - delim.len()];
+            if !without.trim().is_empty() {
+                buf.push(without.trim_end().to_string());
+            }
             break;
         }
-        buf.push(l.to_string());
+        buf.push(l.trim_end().to_string());
         i += 1;
     }
-    buf.join("\n").trim().to_string()
+    // strip trailing blank lines
+    while buf.last().map(|l: &String| l.trim().is_empty()).unwrap_or(false) {
+        buf.pop();
+    }
+    buf.join("\n")
 }
 
 
@@ -550,8 +591,21 @@ fn render_class(cls: &ClassDef, index: &AnchorIndex, cfg: &SourceConfig, doc_pat
         for method in &cls.methods {
             md.push_str(&format!("### {}\n\n", method.name));
             let async_kw = if method.is_async { "async " } else { "" };
-            md.push_str(&format!("```python\n{}def {}({})\n```\n\n",
-                async_kw, method.name, method.signature));
+            let sig_display = if method.signature.is_empty() {
+                format!("{}def {}()", async_kw, method.name)
+            } else {
+                let params: Vec<&str> = method.signature.split(", ").collect();
+                if params.len() <= 3 || method.signature.len() < 80 {
+                    format!("{}def {}({})", async_kw, method.name, method.signature)
+                } else {
+                    let inner = params.iter()
+                        .map(|p| format!("    {}", p))
+                        .collect::<Vec<_>>()
+                        .join(",\n");
+                    format!("{}def {}(\n{}\n)", async_kw, method.name, inner)
+                }
+            };
+            md.push_str(&format!("```python\n{}\n```\n\n", sig_display));
             if !method.docstring.is_empty() {
                 md.push_str(&rst_to_md_with_links(&method.docstring, index, doc_path, &cfg.out));
                 md.push('\n');
@@ -606,75 +660,65 @@ fn rst_to_md_with_links(rst: &str, index: &AnchorIndex, current_doc: &str, sourc
         }
     }).to_string();
 
-    // now apply the rest of rst_to_md (everything except the :class:/:meth: we already handled)
-    rst_to_md_no_class_meth(&out)
+    // apply remaining RST transforms (everything except :class:/:meth: already handled above)
+    apply_rst_transforms(&out)
 }
 
-/// Same as rst_to_md but skips :class: and :meth: (already resolved by caller).
-fn rst_to_md_no_class_meth(rst: &str) -> String {
+fn apply_rst_transforms(rst: &str) -> String {
     let mut out = rst.to_string();
-    let re_attr = Regex::new(r":attr:`([^`]+)`").unwrap();
-    out = re_attr.replace_all(&out, "`$1`").to_string();
-    let re_obj = Regex::new(r":obj:`([^`]+)`").unwrap();
-    out = re_obj.replace_all(&out, "`$1`").to_string();
+
+    // inline roles -> backtick code
+    for role in &["attr", "obj", "exc", "paramref", "func", "data", "const", "type"] {
+        let re = Regex::new(&format!(r":{role}:`([^`]+)`")).unwrap();
+        out = re.replace_all(&out, "`$1`").to_string();
+    }
     let re_any = Regex::new(r":(?:any|ref|wiki):`([^<`]+)(?:\s*<[^>]+>)?`").unwrap();
     out = re_any.replace_all(&out, "`$1`").to_string();
-    out = convert_rst_code_blocks(&out);
-    let re_version = Regex::new(r"\.\. version(?:added|changed|deprecated)::\s*(\S+)([^\n]*)").unwrap();
-    out = re_version.replace_all(&out, "> *$0*").to_string();
-    let re_seealso = Regex::new(r"\.\. seealso::([^\n]*)").unwrap();
+
+    // |substitution| patterns (PTB uses |bot_api_link|, |tg_stars|, etc.) - strip them
+    let re_sub = Regex::new(r"\|[\w_]+\|").unwrap();
+    out = re_sub.replace_all(&out, "").to_string();
+
+    // .. directive:: args  (versionadded, versionchanged, deprecated)
+    let re_version = Regex::new(r"\.\.\s*version(?:added|changed)::\s*(\S+)").unwrap();
+    out = re_version.replace_all(&out, "> *Added in v$1*").to_string();
+    let re_deprecated = Regex::new(r"\.\.\s*deprecated::\s*(\S+)([^\n]*)").unwrap();
+    out = re_deprecated.replace_all(&out, "> *Deprecated since v$1$2*").to_string();
+
+    // .. seealso::
+    let re_seealso = Regex::new(r"\.\.\s*seealso::([^\n]*)").unwrap();
     out = re_seealso.replace_all(&out, "**See also:**$1").to_string();
-    let re_admonition = Regex::new(r"\.\. (note|tip|warning|caution)::([^\n]*)").unwrap();
+
+    // .. note/tip/warning/caution
+    let re_admonition = Regex::new(r"\.\.\s*(note|tip|warning|caution)::([^\n]*)").unwrap();
     out = re_admonition.replace_all(&out, "> **$1:**$2").to_string();
+
+    // remaining .. directives - drop the directive line
+    let re_directive = Regex::new(r"\.\.\s*\w[\w-]*::([^\n]*)").unwrap();
+    out = re_directive.replace_all(&out, "").to_string();
+
+    // code blocks
+    out = convert_rst_code_blocks(&out);
+
+    // collapse 3+ blank lines to 2
+    let re_blanks = Regex::new(r"\n{3,}").unwrap();
+    out = re_blanks.replace_all(&out, "\n\n").to_string();
+
     out
 }
 
-/// Minimal RST -> Markdown conversion for docstrings.
+/// Minimal RST -> Markdown conversion (no link resolution).
 fn rst_to_md(rst: &str) -> String {
     let mut out = rst.to_string();
-
-    // :class:`telegram.Bot` -> `Bot`
     let re_class = Regex::new(r":class:`([^`]+)`").unwrap();
     out = re_class.replace_all(&out, |caps: &regex::Captures| {
-        let name = caps[1].split('.').last().unwrap_or(&caps[1]).to_string();
-        format!("`{}`", name)
+        format!("`{}`", caps[1].split('.').last().unwrap_or(&caps[1]))
     }).to_string();
-
-    // :meth:`telegram.Bot.send_message` -> `send_message`
     let re_meth = Regex::new(r":meth:`([^`]+)`").unwrap();
     out = re_meth.replace_all(&out, |caps: &regex::Captures| {
-        let name = caps[1].split('.').last().unwrap_or(&caps[1]).to_string();
-        format!("`{}`", name)
+        format!("`{}`", caps[1].split('.').last().unwrap_or(&caps[1]))
     }).to_string();
-
-    // :attr:`foo` -> `foo`
-    let re_attr = Regex::new(r":attr:`([^`]+)`").unwrap();
-    out = re_attr.replace_all(&out, "`$1`").to_string();
-
-    // :obj:`True` -> `True`
-    let re_obj = Regex::new(r":obj:`([^`]+)`").unwrap();
-    out = re_obj.replace_all(&out, "`$1`").to_string();
-
-    // :any:`label <target>` -> `label`
-    let re_any = Regex::new(r":(?:any|ref|wiki):`([^<`]+)(?:\s*<[^>]+>)?`").unwrap();
-    out = re_any.replace_all(&out, "`$1`").to_string();
-
-    // .. code:: python / .. code-block:: python -> fenced code block
-    out = convert_rst_code_blocks(&out);
-
-    // .. versionadded/changed/deprecated -> blockquote note
-    let re_version = Regex::new(r"\.\. version(?:added|changed|deprecated)::\s*(\S+)([^\n]*)").unwrap();
-    out = re_version.replace_all(&out, "> *$0*").to_string();
-
-    // .. seealso:: -> **See also:**
-    let re_seealso = Regex::new(r"\.\. seealso::([^\n]*)").unwrap();
-    out = re_seealso.replace_all(&out, "**See also:**$1").to_string();
-
-    // .. note:: / .. tip:: / .. warning:: -> blockquote
-    let re_admonition = Regex::new(r"\.\. (note|tip|warning|caution)::([^\n]*)").unwrap();
-    out = re_admonition.replace_all(&out, "> **$1:**$2").to_string();
-
-    out
+    apply_rst_transforms(&out)
 }
 
 fn render_changelog_entry(entry: &ChangelogEntry, out_prefix: &str) -> String {
